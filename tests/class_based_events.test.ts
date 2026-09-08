@@ -2,7 +2,7 @@
  * Tests for class-based events, EventDispatcher, and @Listener decorator
  */
 
-import { assertEquals, assertExists } from '@std/assert'
+import { assertEquals, assertExists, assertStrictEquals } from '@std/assert'
 import {
     BaseEvent,
     configureEventDispatcher,
@@ -227,14 +227,20 @@ Deno.test('dispatcher - returns global dispatcher', () => {
     const d1 = dispatcher()
     const d2 = dispatcher()
 
-    assertEquals(d1, d2)
+    // STRICT: this is an identity claim. `assertEquals` is structural, and two
+    // freshly-constructed EventDispatchers with no listeners compare equal — so
+    // it passes for an implementation that returns a new instance every call,
+    // which is the one thing this test exists to rule out.
+    assertStrictEquals(d1, d2)
 })
 
 Deno.test('configureEventDispatcher - creates new global dispatcher', () => {
     const d1 = configureEventDispatcher()
     const d2 = dispatcher()
 
-    assertEquals(d1, d2)
+    // Same reason: the claim is that dispatcher() now hands back the instance
+    // configureEventDispatcher just installed, not one that looks like it.
+    assertStrictEquals(d1, d2)
 })
 
 // =============================================================================
@@ -450,4 +456,96 @@ Deno.test('Integration - listener class with DI pattern', async () => {
     } finally {
         console.log = originalLog
     }
+})
+
+Deno.test('EventDispatcher - forwards a signal and wires nothing itself', async () => {
+    // FR-005: the dispatcher is a pass-through. If it grew its own abort
+    // handling there would be two decisions about when a listener dies, and the
+    // wildcard path would have a third.
+    class Ping extends BaseEvent {}
+
+    const dispatcher = new EventDispatcher()
+    const controller = new AbortController()
+    let specific = 0
+    let wildcard = 0
+
+    dispatcher.on(Ping, () => void specific++, { signal: controller.signal })
+    dispatcher.onAny(() => void wildcard++, { signal: controller.signal })
+
+    await dispatcher.emit(new Ping())
+    assertEquals(specific, 1)
+    assertEquals(wildcard, 1)
+
+    controller.abort()
+    await dispatcher.emit(new Ping())
+    assertEquals(specific, 1, 'the specific listener was removed')
+    assertEquals(wildcard, 1, 'and so was the wildcard one')
+})
+
+Deno.test('EventDispatcher - an already-aborted signal registers nothing', async () => {
+    class Pong extends BaseEvent {}
+
+    const dispatcher = new EventDispatcher()
+    const controller = new AbortController()
+    controller.abort()
+
+    let ran = 0
+    dispatcher.on(Pong, () => void ran++, { signal: controller.signal })
+
+    await dispatcher.emit(new Pong())
+    assertEquals(ran, 0)
+})
+
+Deno.test('removeAllListeners detaches EventBuffer’s recorder', async () => {
+    // Not a defect being fixed — a trap being pinned. EventBuffer records by
+    // registering an ordinary wildcard listener, and removeAllListeners()
+    // clears wildcards. Any test that calls it kills the recorder, and every
+    // later assertEmitted then fails while pointing the developer at production
+    // code that emitted perfectly well.
+    class Ping extends BaseEvent {}
+
+    const buffer = fake()
+    try {
+        await buffer.getDispatcher().emit(new Ping())
+        assertEquals(buffer.count(), 1)
+
+        buffer.getDispatcher().getEmitter().removeAllListeners()
+
+        await buffer.getDispatcher().emit(new Ping())
+        assertEquals(
+            buffer.count(),
+            1,
+            'the recorder is gone — this is the trap, documented rather than fixed',
+        )
+    } finally {
+        restore()
+    }
+})
+
+Deno.test('EventDispatcher - anyEvent yields real frames and forwards its options', async () => {
+    // Its whole test was `typeof dispatcher().anyEvent === 'function'`, which
+    // survives dropping the argument, dropping the body, and returning a stub.
+    class Alpha extends BaseEvent {}
+    class Beta extends BaseEvent {}
+
+    const dispatcher = new EventDispatcher()
+    const stream = dispatcher.anyEvent({
+        bufferSize: 1,
+        onOverflow: 'drop-newest',
+    })
+
+    await dispatcher.emit(new Alpha())
+    await dispatcher.emit(new Beta())
+
+    await stream.return!()
+    const seen: string[] = []
+    for await (const frame of stream) seen.push(frame.event)
+
+    // bufferSize 1 + drop-newest keeps the FIRST and drops the second, which is
+    // only true if both options reached the queue.
+    assertEquals(
+        seen,
+        ['Alpha'],
+        'the frame carries the class name, and the options took',
+    )
 })
